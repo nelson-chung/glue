@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import sys
 from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
@@ -6,7 +7,8 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 from datetime import datetime
 from pyspark.pandas import spark
-from pyspark.sql.functions import collect_list, current_timestamp, explode, lit, when, window, size
+from pyspark.pandas.frame import DataFrame
+from pyspark.sql.functions import collect_list, count, current_timestamp, explode, lit, when, window, size
 
 
 from pyspark.sql.functions import from_json, col, size
@@ -15,6 +17,14 @@ import boto3
 import json
 
 
+@dataclass
+class DynamoParams:
+    id: str
+    window_begin: datetime
+    window_end: datetime
+    accumulate: int
+    is_over_threshold:bool
+    create_timestamp: datetime
 
 class GluePythonSampleTest:
 
@@ -37,7 +47,7 @@ class GluePythonSampleTest:
             self.logger = logging.getLogger()
             self.logger.addHandler(console_handler)
             self.infer_field = "`$json$data_infer_schema$.temporary$`"
-            self.checkpoint = "/tmp/checkpoint"
+            self.checkpoint = "/home/glue_user/ck"
             session = boto3.Session(profile_name='AppDev')  # Replace 'myprofile' with your profile name
             c = session.get_credentials()
             self.credentials = {
@@ -51,7 +61,7 @@ class GluePythonSampleTest:
         self.spark.conf.set("spark.sql.streaming.forceDeleteTempCheckpointLocation", True)
         self.job = Job(self.context)
         self.dynamodb = boto3.resource('dynamodb')
-        self.table = self.dynamodb.Table('pipeline_circuit_breaker_state') 
+        self.table = self.dynamodb.Table('pipeline_circuit_breaker_state_glue') 
 
 
         if 'JOB_NAME' in self.args:
@@ -82,25 +92,83 @@ class GluePythonSampleTest:
             )
             self.logger.info(f"Lambda invoked with response: {response}")
 
-    def write_to_dynamodb(self, batch_df, batch_id):
-        # Collect the data from the DataFrame
-        batch_json = batch_df.collect()
-        new_timestamp = int(datetime.now().timestamp())
-        # Insert each record into DynamoDB
-        self.logger.info(f'get batch_json success, length of batch: {len(batch_json)}....................')
-        for record in batch_json:
-            token = record[1]
-            is_over_threshold = int(record[2]) > 10
+    def theshold_check(self, batch_df, batch_id: DataFrame):
+
+        try:
+            new_timestamp =datetime.now()
+            self.logger.info(f'get incomming data....................')
+            incomming= batch_df.withColumn('accumulate', size(col("device_token_list")))
+            self.logger.info(f'get data success....................')
+            if incomming.isEmpty():
+                self.logger.info(f'incomming data empty....................')
+                return
+            time_window = incomming.first()['window']
+            total_count = incomming.first()['accumulate']
+            db_threshold = 100
+            device_threshold = 10
+            if total_count < db_threshold:
+                self.logger.info(f'reocrds less then db theshold: {db_threshold}, count: {total_count}....................')
+                self.sync_to_dynamo([
+                    DynamoParams(
+                        id= 'db',
+                        window_begin= time_window[0],
+                        window_end= time_window[1],
+                        accumulate= total_count,
+                        is_over_threshold= False,
+                        create_timestamp= new_timestamp
+                    ) ]
+                )
+                return
+            exploded_df = batch_df.withColumn("device_token", explode(col("device_token_list")))\
+                    .drop("device_token_list") \
+                    .groupBy("window", "device_token") \
+                    .agg(count("device_token").alias("accumulate")) \
+                    .filter(col("accumulate") > device_threshold )
+        
+            
+            self.sync_to_dynamo(
+            [ 
+                DynamoParams(
+                    id= f'device#{r["device_token"]}',
+                    window_begin= time_window[0],
+                    window_end= time_window[1],
+                    accumulate= r["accumulate"],
+                    is_over_threshold= True,
+                    create_timestamp= new_timestamp
+                ) for r in exploded_df.collect()                       
+            ] + 
+            [
+                DynamoParams(
+                        id= 'db',
+                        window_begin= time_window[0],
+                        window_end= time_window[1],
+                        accumulate= total_count,
+                        is_over_threshold= True,
+                        create_timestamp= new_timestamp
+                    ) 
+            ] )
+            self.logger.info(f'theshold_check success....................')
+        except Exception as ex:
+            self.logger.error(f'theshold_check fail....................')
+            self.logger.error(ex)
+        
+
+    def sync_to_dynamo(self, params: list[DynamoParams]):
+
+        for p in params:
             try:
                 response = self.table.update_item(
                     Key={
-                        'device_token': token
+                        'id': p.id
                     },
-                UpdateExpression="set is_over_threshold = :flag, create_timestamp = :stamp",
-                ConditionExpression="attribute_not_exists(create_timestamp) OR create_timestamp < :stamp",  # Only update if the new timestamp is more recent
+                UpdateExpression="set window_begin = :window_begin,  winddow_end = :window_end, is_over_threshold = :flag, accumulate = :cnt, create_timestamp = :stamp",
+                ConditionExpression="attribute_not_exists(create_timestamp) OR create_timestamp < :stamp",  
                 ExpressionAttributeValues={
-                    ':flag': is_over_threshold,            
-                    ':stamp': str(new_timestamp)   
+                    ':window_begin': str(int(p.window_begin.timestamp())),
+                    ':window_end': str(int(p.window_end.timestamp())),
+                    ':cnt':  p.accumulate,
+                    ':flag': p.is_over_threshold,            
+                    ':stamp': str(int(p.create_timestamp.timestamp()))
                 },
             )
                 self.logger.info('write_to_dynamodb success............................................................')
@@ -121,7 +189,8 @@ class GluePythonSampleTest:
                     # "startingPosition": "2023-04-04T08:00:00Z", 
                     # "startingPosition": init_time, 
                     "maxFetchTimeInMs": 15000,
-                    "inferSchema": "true"
+                    "inferSchema": "true",
+                    "addRecordTimestamp": "true"
                 }, 
                 **self.credentials}
              
@@ -169,22 +238,22 @@ class GluePythonSampleTest:
         self.logger.info('print data_with_timestamp schema............................................................')
         self.logger.info( str(data_with_timestamp.schema))
         
-        tumbling_windowed_data = data_with_timestamp \
-            .withWatermark("processing_time", "5 minutes")\
-            .groupBy(
-                window(data_with_timestamp["processing_time"], "5 minutes"),
-                data_with_timestamp["device_token"] 
-        ).agg({"data_count": "sum"}).withColumnRenamed("sum(data_count)", "total_data_count")
+        # tumbling_windowed_data = data_with_timestamp \
+        #     .withWatermark("processing_time", "5 minutes")\
+        #     .groupBy(
+        #         window(data_with_timestamp["processing_time"], "5 minutes"),
+        #         data_with_timestamp["device_token"] 
+        # ).agg({"data_count": "sum"}).withColumnRenamed("sum(data_count)", "total_data_count")
 
         
                 
-        # tumbling_windowed_data = data_with_timestamp \
-        #     .withWatermark("processing_time", "5 minutes") \
-        #     .groupBy(
-        #         window(data_with_timestamp["processing_time"], "5 minutes")
-        #     ) \
-        #     .agg(collect_list(col("device_token")) \
-        #     .alias("device_token_list"))
+        tumbling_windowed_data = data_with_timestamp \
+            .withWatermark("processing_time", "5 minutes") \
+            .groupBy(
+                window(data_with_timestamp["processing_time"], "5 minutes")
+            ) \
+            .agg(collect_list(col("device_token")) \
+            .alias("device_token_list"))
 
         self.logger.info('print tumbling_windowed_data schema............................................................')
         self.logger.info( str(tumbling_windowed_data.schema))
@@ -194,7 +263,7 @@ class GluePythonSampleTest:
             .outputMode("update") \
             .trigger(processingTime= '15 seconds')\
             .option("checkpointLocation", self.checkpoint) \
-            .foreachBatch(self.write_to_dynamodb) \
+            .foreachBatch(self.theshold_check) \
             .start()\
             .awaitTermination()
         
