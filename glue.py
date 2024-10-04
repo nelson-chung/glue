@@ -58,7 +58,8 @@ class GluePythonSampleTest:
         self.context = GlueContext(SparkContext())
         self.logger = self.context.get_logger()
         self.spark = self.context.spark_session
-        self.spark.conf.set("spark.sql.streaming.forceDeleteTempCheckpointLocation", True)
+        self.spark.conf.set("spark.sql.streaming.forceDeleteTempCheckpointLocation", False)
+        self.spark.conf.set("spark.streaming.backpressure.enabled", True)
         self.job = Job(self.context)
         self.dynamodb = boto3.resource('dynamodb')
         self.table = self.dynamodb.Table('pipeline_circuit_breaker_state_glue') 
@@ -92,7 +93,7 @@ class GluePythonSampleTest:
             )
             self.logger.info(f"Lambda invoked with response: {response}")
 
-    def theshold_check(self, batch_df, batch_id: DataFrame):
+    def check_db_theshold(self, batch_df, batch_id):
 
         try:
             new_timestamp =datetime.now()
@@ -101,12 +102,10 @@ class GluePythonSampleTest:
             self.logger.info(f'get data success....................')
             if incomming.isEmpty():
                 self.logger.info(f'incomming data empty....................')
-                return
-            time_window = incomming.first()['window']
-            total_count = incomming.first()['accumulate']
-            db_threshold = 100
-            device_threshold = 10
-            if total_count < db_threshold:
+            else:
+                time_window = incomming.first()['window']
+                total_count = incomming.first()['accumulate']
+                db_threshold = 100
                 self.logger.info(f'reocrds less then db theshold: {db_threshold}, count: {total_count}....................')
                 self.sync_to_dynamo([
                     DynamoParams(
@@ -114,44 +113,36 @@ class GluePythonSampleTest:
                         window_begin= time_window[0],
                         window_end= time_window[1],
                         accumulate= total_count,
-                        is_over_threshold= False,
+                        is_over_threshold= total_count > db_threshold,
                         create_timestamp= new_timestamp
                     ) ]
                 )
-                return
-            exploded_df = batch_df.withColumn("device_token", explode(col("device_token_list")))\
-                    .drop("device_token_list") \
-                    .groupBy("window", "device_token") \
-                    .agg(count("device_token").alias("accumulate")) \
-                    .filter(col("accumulate") > device_threshold )
-        
+                self.logger.info(f'theshold_check success....................')
+        except Exception as ex:
+            self.logger.error(f'theshold_check fail....................')
+            self.logger.error(ex)
             
+    def check_device_theshold(self, batch_df, batch_id):
+
+        try:
+            new_timestamp =datetime.now()
+            device_threshold = 10
+            df = batch_df.filter(col("accumulate") > device_threshold ).collect()   
             self.sync_to_dynamo(
             [ 
                 DynamoParams(
                     id= f'device#{r["device_token"]}',
-                    window_begin= time_window[0],
-                    window_end= time_window[1],
+                    window_begin= r['window'][0],
+                    window_end=  r['window'][0],
                     accumulate= r["accumulate"],
-                    is_over_threshold= True,
+                    is_over_threshold= r["accumulate"] > device_threshold,
                     create_timestamp= new_timestamp
-                ) for r in exploded_df.collect()                       
-            ] + 
-            [
-                DynamoParams(
-                        id= 'db',
-                        window_begin= time_window[0],
-                        window_end= time_window[1],
-                        accumulate= total_count,
-                        is_over_threshold= True,
-                        create_timestamp= new_timestamp
-                    ) 
-            ] )
+                ) for r in df                   
+            ])
             self.logger.info(f'theshold_check success....................')
         except Exception as ex:
             self.logger.error(f'theshold_check fail....................')
             self.logger.error(ex)
-        
 
     def sync_to_dynamo(self, params: list[DynamoParams]):
 
@@ -238,16 +229,9 @@ class GluePythonSampleTest:
         self.logger.info('print data_with_timestamp schema............................................................')
         self.logger.info( str(data_with_timestamp.schema))
         
-        # tumbling_windowed_data = data_with_timestamp \
-        #     .withWatermark("processing_time", "5 minutes")\
-        #     .groupBy(
-        #         window(data_with_timestamp["processing_time"], "5 minutes"),
-        #         data_with_timestamp["device_token"] 
-        # ).agg({"data_count": "sum"}).withColumnRenamed("sum(data_count)", "total_data_count")
 
-        
                 
-        tumbling_windowed_data = data_with_timestamp \
+        tumbling_windowed_db = data_with_timestamp \
             .withWatermark("processing_time", "5 minutes") \
             .groupBy(
                 window(data_with_timestamp["processing_time"], "5 minutes")
@@ -255,18 +239,31 @@ class GluePythonSampleTest:
             .agg(collect_list(col("device_token")) \
             .alias("device_token_list"))
 
-        self.logger.info('print tumbling_windowed_data schema............................................................')
-        self.logger.info( str(tumbling_windowed_data.schema))
+        tumbling_windowed_device = data_with_timestamp \
+            .withWatermark("processing_time", "5 minutes") \
+            .groupBy(
+                window(data_with_timestamp["processing_time"], "5 minutes"),
+                col("device_token")
+            ) \
+            .agg(count("*").alias("accumulate"))
 
-
-        query = tumbling_windowed_data.writeStream \
+        query1 = tumbling_windowed_db.writeStream \
             .outputMode("update") \
             .trigger(processingTime= '15 seconds')\
-            .option("checkpointLocation", self.checkpoint) \
-            .foreachBatch(self.theshold_check) \
+            .option("checkpointLocation", self.checkpoint + '/db') \
+            .foreachBatch(self.check_db_theshold) \
+            .start()\
+ 
+        
+
+        query2 = tumbling_windowed_device.writeStream \
+            .outputMode("update") \
+            .trigger(processingTime= '15 seconds')\
+            .option("checkpointLocation", self.checkpoint + '/device') \
+            .foreachBatch(self.check_device_theshold) \
             .start()\
             .awaitTermination()
-        
+
 
 if __name__ == '__main__':
     GluePythonSampleTest().run()
