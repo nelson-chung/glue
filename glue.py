@@ -100,11 +100,13 @@ class GluePythonSampleTest:
             self.logger.info(f'get incomming data....................')
             incomming= batch_df.withColumn('accumulate', size(col("device_token_list")))
             self.logger.info(f'get data success....................')
-            if incomming.isEmpty():
+            row = incomming.collect()   
+            # row = incomming.first()
+            if len(row) == 0:
                 self.logger.info(f'incomming data empty....................')
             else:
-                time_window = incomming.first()['window']
-                total_count = incomming.first()['accumulate']
+                time_window = row[0]['window']
+                total_count = row[0]['accumulate']
                 db_threshold = 100
                 self.logger.info(f'reocrds less then db theshold: {db_threshold}, count: {total_count}....................')
                 self.sync_to_dynamo([
@@ -252,8 +254,7 @@ class GluePythonSampleTest:
             .trigger(processingTime= '15 seconds')\
             .option("checkpointLocation", self.checkpoint + '/db') \
             .foreachBatch(self.check_db_theshold) \
-            .start()\
- 
+            .start()
         
 
         query2 = tumbling_windowed_device.writeStream \
