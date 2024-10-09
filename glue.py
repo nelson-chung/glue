@@ -5,7 +5,7 @@ from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
-from datetime import datetime
+from datetime import datetime, timedelta
 from pyspark.pandas import spark
 from pyspark.pandas.frame import DataFrame
 from pyspark.sql.functions import collect_list, count, current_timestamp, explode, lit, when, window, size
@@ -31,6 +31,7 @@ class GluePythonSampleTest:
     def __init__(self):
         params = []
         self.credentials = {}
+
         if '--JOB_NAME' in sys.argv:
             params.append('JOB_NAME')
             self.args = getResolvedOptions(sys.argv, params)
@@ -54,7 +55,13 @@ class GluePythonSampleTest:
                 "awsAccessKeyId": c.access_key,
                 "awsSecretKey": c.secret_key,
             }
-            
+
+        config = self.get_config()
+        self.trigger_interval = config['trigger_interval_sec']
+        self.window_size = config['window_size_minute']
+        self.db_threshold = config['db_threshold']
+        self.device_threshold = config['device_threshold']
+
         self.context = GlueContext(SparkContext())
         self.logger = self.context.get_logger()
         self.spark = self.context.spark_session
@@ -70,6 +77,15 @@ class GluePythonSampleTest:
         else:
             jobname = "test"
         self.job.init(jobname, self.args)
+
+    def get_config(self):
+        ssm = boto3.client('ssm')
+        response = ssm.get_parameter(
+            Name='glue',
+            WithDecryption=True  # Set to True if it's a SecureString
+        )
+        parameter_value = response['Parameter']['Value']
+        return json.loads(parameter_value)
 
     def invoke_lambda(self, batch_df, batch_id):
         # Initialize the Lambda client
@@ -107,15 +123,14 @@ class GluePythonSampleTest:
             else:
                 time_window = row[0]['window']
                 total_count = row[0]['accumulate']
-                db_threshold = 100
-                self.logger.info(f'reocrds less then db theshold: {db_threshold}, count: {total_count}....................')
+                self.logger.info(f'reocrds less then db theshold: {self.db_threshold}, count: {total_count}....................')
                 self.sync_to_dynamo([
                     DynamoParams(
                         id= 'db',
                         window_begin= time_window[0],
                         window_end= time_window[1],
                         accumulate= total_count,
-                        is_over_threshold= total_count > db_threshold,
+                        is_over_threshold= total_count > self.db_threshold,
                         create_timestamp= new_timestamp
                     ) ]
                 )
@@ -128,8 +143,8 @@ class GluePythonSampleTest:
 
         try:
             new_timestamp =datetime.now()
-            device_threshold = 10
-            df = batch_df.filter(col("accumulate") > device_threshold ).collect()   
+            # df = batch_df.filter(col("accumulate") > device_threshold ).collect()   
+            df = batch_df.collect()   
             self.sync_to_dynamo(
             [ 
                 DynamoParams(
@@ -137,7 +152,7 @@ class GluePythonSampleTest:
                     window_begin= r['window'][0],
                     window_end=  r['window'][0],
                     accumulate= r["accumulate"],
-                    is_over_threshold= r["accumulate"] > device_threshold,
+                    is_over_threshold= r["accumulate"] > self.device_threshold,
                     create_timestamp= new_timestamp
                 ) for r in df                   
             ])
@@ -150,25 +165,26 @@ class GluePythonSampleTest:
 
         for p in params:
             try:
+                ttl = str(int((p.create_timestamp + timedelta(minutes=5)).timestamp()))
                 response = self.table.update_item(
                     Key={
                         'id': p.id
                     },
-                UpdateExpression="set window_begin = :window_begin,  winddow_end = :window_end, is_over_threshold = :flag, accumulate = :cnt, create_timestamp = :stamp",
+                UpdateExpression="set window_begin = :window_begin,  winddow_end = :window_end, is_over_threshold = :flag, accumulate = :cnt, create_timestamp = :stamp, expiredAt = :expiredAt",
                 ConditionExpression="attribute_not_exists(create_timestamp) OR create_timestamp < :stamp",  
                 ExpressionAttributeValues={
                     ':window_begin': str(int(p.window_begin.timestamp())),
                     ':window_end': str(int(p.window_end.timestamp())),
                     ':cnt':  p.accumulate,
                     ':flag': p.is_over_threshold,            
-                    ':stamp': str(int(p.create_timestamp.timestamp()))
+                    ':stamp': str(int(p.create_timestamp.timestamp())),
+                    ':expiredAt': ttl
                 },
             )
                 self.logger.info('write_to_dynamodb success............................................................')
                 self.logger.info(json.dumps(response))
             except Exception as e:
                 self.logger.error(f"Failed to fetch or update the record: {e}")
-
 
     def run(self):
         # init_time= (datetime.datetime.now() - datetime.timedelta(seconds=60)).isoformat()
@@ -183,23 +199,17 @@ class GluePythonSampleTest:
                     # "startingPosition": init_time, 
                     "maxFetchTimeInMs": 15000,
                     "inferSchema": "true",
-                    "addRecordTimestamp": "true"
+                    "addRecordTimestamp": 'true',
+                    # "schema": '`device_token` STRING'
+                    # "schema": 'STRUCT<`device_token`: STRING>'
                 }, 
                 **self.credentials}
+        
              
         dataframe_AmazonKinesis_node1726723872587 = self.context.create_data_frame.from_options(
             connection_type="kinesis",
             connection_options= options,
             transformation_ctx="dataframe_AmazonKinesis_node1726723872587")
-                        
-        t = str(type(dataframe_AmazonKinesis_node1726723872587))
-        s = str(dataframe_AmazonKinesis_node1726723872587.schema)
-        self.logger.info('print type............................................................')
-        self.logger.info(t)
-        self.logger.info('print schema............................................................')
-        self.logger.info(s)
-        self.logger.info('print infer schema............................................................')
-        self.logger.info(self.infer_field)
 
         json_schema = StructType([
             StructField("device_token", StringType(), True),
@@ -210,33 +220,16 @@ class GluePythonSampleTest:
             "parsed_json", from_json(col(self.infer_field), json_schema)
         )
 
-        self.logger.info('print parsed schema............................................................')
-        self.logger.info( str(parsed_data.schema))
-        
-        # Extract the `data` field from the parsed JSON
         extracted_data = parsed_data.select(col("parsed_json.device_token"), col("parsed_json.data"))
 
-        self.logger.info('print extracted_data schema............................................................')
-        self.logger.info( str(extracted_data.schema))
-        
-        # Count the elements in the `data` field
         data_with_count = extracted_data.withColumn("data_count", size(col("data")))
 
-        self.logger.info('print data_with_count schema............................................................')
-        self.logger.info( str(data_with_count.schema))
-        
-
         data_with_timestamp  = data_with_count.withColumn("processing_time", current_timestamp())
-
-        self.logger.info('print data_with_timestamp schema............................................................')
-        self.logger.info( str(data_with_timestamp.schema))
-        
-
                 
         tumbling_windowed_db = data_with_timestamp \
             .withWatermark("processing_time", "5 minutes") \
             .groupBy(
-                window(data_with_timestamp["processing_time"], "5 minutes")
+                window(data_with_timestamp["processing_time"], f"{self.window_size} minutes")
             ) \
             .agg(collect_list(col("device_token")) \
             .alias("device_token_list"))
@@ -244,14 +237,14 @@ class GluePythonSampleTest:
         tumbling_windowed_device = data_with_timestamp \
             .withWatermark("processing_time", "5 minutes") \
             .groupBy(
-                window(data_with_timestamp["processing_time"], "5 minutes"),
+                window(data_with_timestamp["processing_time"], f"{self.window_size} minutes"),
                 col("device_token")
             ) \
             .agg(count("*").alias("accumulate"))
 
         query1 = tumbling_windowed_db.writeStream \
             .outputMode("update") \
-            .trigger(processingTime= '15 seconds')\
+            .trigger(processingTime= f'{ self.trigger_interval} seconds')\
             .option("checkpointLocation", self.checkpoint + '/db') \
             .foreachBatch(self.check_db_theshold) \
             .start()
@@ -259,11 +252,12 @@ class GluePythonSampleTest:
 
         query2 = tumbling_windowed_device.writeStream \
             .outputMode("update") \
-            .trigger(processingTime= '15 seconds')\
+            .trigger(processingTime= f'{ self.trigger_interval} seconds')\
             .option("checkpointLocation", self.checkpoint + '/device') \
             .foreachBatch(self.check_device_theshold) \
             .start()\
             .awaitTermination()
+
 
 
 if __name__ == '__main__':
