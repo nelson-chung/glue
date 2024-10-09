@@ -191,7 +191,7 @@ class GluePythonSampleTest:
         options =  {
                 **{
                     "typeOfData": "kinesis", 
-                    "streamARN": "arn:aws:kinesis:us-east-1:719709800508:stream/yuan-playground", 
+                    "streamARN": "arn:aws:kinesis:us-east-1:719709800508:stream/glue-test", 
                     "classification": "json", 
                     "startingPosition": "LATEST", 
                     # "startingPosition": f"\'{init_time}\'",
