@@ -27,6 +27,6 @@ jobs:
         run: |
           aws ssm send-command \
             --document-name "AWS-RunShellScript" \
-            --targets "Key=instanceIds,Values=i-0b53c2f51f46ac3f4" \
+            --targets "Key=instanceIds,Values=i-0ac0b7b9e151c66df" \
             --parameters '{"commands":["echo Hello from GitHub Action!"]}' \
             --region us-east-1
