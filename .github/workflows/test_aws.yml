@@ -17,7 +17,7 @@ jobs:
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v2
         with:
-          role-to-assume: arn:aws:iam::<YOUR_ACCOUNT_ID>:role/<YOUR_ROLE_NAME>
+          role-to-assume: arn:aws:iam::719709800508:role/test_GitHubOIDC_GlueSSMRole
           aws-region: us-east-1
 
       - name: Call SSM API
